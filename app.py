@@ -6,7 +6,7 @@ import streamlit as st
 import google.generativeai as genai
 from youtube_transcript_api import YouTubeTranscriptApi
 
-genai.configure(api_key="AIzaSyA_EZT7FPJqfklOkpMjc7hKwMB_QiwmsGk")
+genai.configure(api_key="AIzaSyCCIrjTiRWyWWCOXg6rQoLaw6w-BasQ9Xw")
 model = genai.GenerativeModel("gemini-2.5-flash")
 
 def extract_video_id(url):
