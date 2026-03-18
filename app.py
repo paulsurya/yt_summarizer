@@ -7,7 +7,7 @@ import google.generativeai as genai
 from youtube_transcript_api import YouTubeTranscriptApi
 
 genai.configure(api_key="AIzaSyA_EZT7FPJqfklOkpMjc7hKwMB_QiwmsGk")
-model = genai.GenerativeModel("gemini-2.5-flash-lite")
+model = genai.GenerativeModel("gemini-2.5-flash")
 
 def extract_video_id(url):
     patterns = [
