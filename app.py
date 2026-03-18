@@ -2,18 +2,52 @@ import os
 os.environ["PYTHONUTF8"] = "1"
 
 import re
+import time
 import streamlit as st
 import google.generativeai as genai
 from youtube_transcript_api import YouTubeTranscriptApi
 
-genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-model = genai.GenerativeModel("gemini-2.5-flash")
+# ── API Key Rotation ─────────────────────────────────────────────────────────
+
+def load_api_keys(path="api_keys.txt"):
+    """Read non-empty lines from api_keys.txt — one key per line."""
+    if not os.path.exists(path):
+        st.error(f"'{path}' not found. Create it and add one Gemini API key per line.")
+        st.stop()
+    with open(path, "r") as f:
+        keys = [line.strip() for line in f if line.strip()]
+    if not keys:
+        st.error(f"'{path}' is empty. Add at least one Gemini API key.")
+        st.stop()
+    return keys
+
+def get_model():
+    """Return a configured Gemini model using the current key."""
+    keys = st.session_state["api_keys"]
+    idx  = st.session_state["key_index"]
+    genai.configure(api_key=keys[idx])
+    return genai.GenerativeModel("gemini-2.5-flash")
+
+def rotate_key():
+    """Advance to the next key. Returns False if all keys exhausted."""
+    keys     = st.session_state["api_keys"]
+    next_idx = st.session_state["key_index"] + 1
+    if next_idx >= len(keys):
+        return False
+    st.session_state["key_index"] = next_idx
+    st.warning(f"⚠️ Rate limit hit — switched to API key {next_idx + 1} of {len(keys)}")
+    return True
+
+# ── Core helpers ─────────────────────────────────────────────────────────────
 
 def extract_video_id(url):
+    url = url.strip()
     patterns = [
-        r"(?:v=|\/)([0-9A-Za-z_-]{11})",
+        r"(?:v=)([0-9A-Za-z_-]{11})",
         r"(?:youtu\.be\/)([0-9A-Za-z_-]{11})",
-        r"(?:embed\/)([0-9A-Za-z_-]{11})"
+        r"(?:embed\/)([0-9A-Za-z_-]{11})",
+        r"(?:shorts\/)([0-9A-Za-z_-]{11})",
+        r"^([0-9A-Za-z_-]{11})$",
     ]
     for pattern in patterns:
         match = re.search(pattern, url)
@@ -25,14 +59,32 @@ def get_transcript(url):
     video_id = extract_video_id(url)
     if not video_id:
         raise ValueError("Could not extract video ID from URL.")
-    ytt = YouTubeTranscriptApi()
-    transcript = ytt.fetch(video_id)
-    return " ".join([snippet.text for snippet in transcript])
+    try:
+        transcript_list = YouTubeTranscriptApi.get_transcript(video_id)
+        return " ".join([s["text"] for s in transcript_list])
+    except Exception:
+        ytt = YouTubeTranscriptApi()
+        transcript = ytt.fetch(video_id)
+        return " ".join([s.text for s in transcript])
 
 def query_gemini(transcript, prompt):
+    """Call Gemini with automatic key rotation on ResourceExhausted / 429."""
     full_prompt = f"Here is the transcript of a YouTube video:\n\n{transcript}\n\n{prompt}"
-    response = model.generate_content(full_prompt)
-    return response.text
+    while True:
+        try:
+            model    = get_model()
+            response = model.generate_content(full_prompt)
+            return response.text
+        except Exception as e:
+            if "ResourceExhausted" in str(e) or "429" in str(e):
+                if not rotate_key():
+                    st.error("❌ All API keys have been rate limited. Please wait and try again later.")
+                    st.stop()
+                time.sleep(3)  # brief pause before retrying with new key
+            else:
+                raise e
+
+# ── Parsers ──────────────────────────────────────────────────────────────────
 
 def parse_quiz(raw):
     questions = []
@@ -42,8 +94,8 @@ def parse_quiz(raw):
         if len(lines) < 5:
             continue
         question = lines[0]
-        options = {}
-        answer = None
+        options  = {}
+        answer   = None
         for line in lines[1:]:
             m = re.match(r'^([A-D])[).]\s+(.*)', line)
             if m:
@@ -52,24 +104,22 @@ def parse_quiz(raw):
             if ans:
                 answer = ans.group(1)
         if question and len(options) == 4 and answer:
-            questions.append({
-                "question": question,
-                "options": options,
-                "answer": answer
-            })
+            questions.append({"question": question, "options": options, "answer": answer})
     return questions
 
 def parse_flashcards(raw):
-    cards = []
+    cards  = []
     blocks = re.split(r'CARD\s*\d+:', raw, flags=re.IGNORECASE)[1:]
     for block in blocks:
         parts = re.split(r'Back:', block, flags=re.IGNORECASE)
         if len(parts) == 2:
-            front_match = re.sub(r'(?i)front:', '', parts[0]).strip()
-            back = parts[1].strip()
-            if front_match and back:
-                cards.append({"front": front_match, "back": back})
+            front = re.sub(r'(?i)front:', '', parts[0]).strip()
+            back  = parts[1].strip()
+            if front and back:
+                cards.append({"front": front, "back": back})
     return cards
+
+# ── Prompts ───────────────────────────────────────────────────────────────────
 
 SUMMARY_PROMPT = """
 Based on this transcript:
@@ -125,8 +175,15 @@ Format it like this:
 Include all major concepts and how they connect.
 """
 
+# ── Main ──────────────────────────────────────────────────────────────────────
+
 def main():
     st.set_page_config(page_title="Video Insight", page_icon="🎬", layout="wide")
+
+    # Initialise key pool once per session
+    if "api_keys" not in st.session_state:
+        st.session_state["api_keys"]  = load_api_keys("api_keys.txt")
+        st.session_state["key_index"] = 0
 
     st.markdown("""
     <style>
@@ -161,6 +218,11 @@ def main():
     st.title("Video Insight")
     st.caption("Paste a YouTube URL → Summary, Quiz, Flashcards & Concept Map powered by Gemini 2.5 Flash")
 
+    # Key status indicator
+    total_keys = len(st.session_state["api_keys"])
+    cur_key    = st.session_state["key_index"] + 1
+    st.info(f"🔑 Using API key {cur_key} of {total_keys}")
+
     url = st.text_input("Enter your YouTube Video URL", placeholder="https://www.youtube.com/watch?v=...")
 
     if st.button("Start Analyzing Video", use_container_width=True):
@@ -178,18 +240,18 @@ def main():
         with st.expander("View Raw Transcript"):
             st.write(transcript)
 
-        with st.spinner("Sending to Gemini..."):
-            summary       = query_gemini(transcript, SUMMARY_PROMPT)
-            quiz_raw      = query_gemini(transcript, QUIZ_PROMPT)
+        with st.spinner("Generating summary..."):
+            summary = query_gemini(transcript, SUMMARY_PROMPT)
+        with st.spinner("Generating quiz..."):
+            quiz_raw = query_gemini(transcript, QUIZ_PROMPT)
+        with st.spinner("Generating flashcards..."):
             flashcard_raw = query_gemini(transcript, FLASHCARD_PROMPT)
-            concept_map   = query_gemini(transcript, CONCEPT_MAP_PROMPT)
-
-        quiz_data  = parse_quiz(quiz_raw)
-        flash_data = parse_flashcards(flashcard_raw)
+        with st.spinner("Generating concept map..."):
+            concept_map = query_gemini(transcript, CONCEPT_MAP_PROMPT)
 
         st.session_state["summary"]      = summary
-        st.session_state["quiz"]         = quiz_data
-        st.session_state["flashcards"]   = flash_data
+        st.session_state["quiz"]         = parse_quiz(quiz_raw)
+        st.session_state["flashcards"]   = parse_flashcards(flashcard_raw)
         st.session_state["concept_map"]  = concept_map
         st.session_state["answers"]      = {}
         st.session_state["submitted"]    = False
@@ -230,7 +292,7 @@ def main():
                     choice = st.radio(
                         label=f"q_{i}",
                         options=[o[0] for o in opts],
-                        format_func=lambda x, opts=opts: next(o for o in opts if o[0]==x),
+                        format_func=lambda x, opts=opts: next(o for o in opts if o[0] == x),
                         key=f"q_{i}",
                         label_visibility="collapsed"
                     )
@@ -279,7 +341,7 @@ def main():
                 if st.button("Prev", use_container_width=True):
                     st.session_state["card_index"]   = max(0, idx - 1)
                     st.session_state["card_flipped"] = False
-                    st.rerun() 
+                    st.rerun()
             with c2:
                 if st.button("Flip", use_container_width=True):
                     st.session_state["card_flipped"] = not flipped
